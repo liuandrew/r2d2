@@ -1,0 +1,17 @@
+# Folders used to save data
+experiment_configs/*
+experiment_configs/archive/*
+runs/*
+saved_checkpoints/*
+saved_models/*
+
+!experiment_configs/.gitkeep
+!runs/.gitkeep
+!saved_checkpoints/.gitkeep
+!saved_models/.gitkeep
+!experiment_configs/archive/.gitkeep
+
+.ipynb_checkpoints/*
+write_and_test/.ipynb_checkpoints/*
+write_and_test/__pycache__/*
+r2d2_algo/__pycache__/*
