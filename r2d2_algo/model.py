@@ -87,6 +87,127 @@ class ResettingGRU(nn.Module):
         return full_out, full_hx_out
             
             
+            
+            
+            
+            
+class ResettingGRUBatched(nn.Module):
+    '''
+    Modification to GRU that can take dones on the forward call to tell when
+    state in the middle of a batched sequence forward call should be reset
+    
+    This version batches the forward call by creating a modified
+      input matrix, appending rows and padding them to handle batching.
+    We get the same output as expected, however due to the padding and inability
+      to do early stopping of GRU, the hidden_state we get is incorrect when batching occurs.
+    Since this forward call with dones is only used during training to generate Q-values,
+      it doesn't affect the output. But be careful using this if the next_rnn_hxs are desired
+      and want to use the forward dones functionality. 
+    '''
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.gru = nn.GRU(**kwargs)
+        
+        self.hidden_size = self.gru.hidden_size
+        self.batch_first = self.gru.batch_first
+        
+    def get_rnn_hxs(self, num_batches=1):
+        '''
+        Get torch.zeros hidden states to start off with
+        '''
+        if num_batches == 1:
+            return torch.zeros(1, self.hidden_size)
+        else:
+            return torch.zeros(1, num_batches, self.hidden_size)
+        
+    
+    def forward(self, x, hidden_state, dones=None):
+        if dones == None:
+            return self.gru(x, hidden_state)
+        
+        #Unfortunately need to split up the batch here
+        if self.batch_first == False:
+            raise NotImplementedError
+        
+        if hidden_state.dim() == 2:
+            hidden_state = hidden_state.unsqueeze(0)
+            x = x.unsqueeze(0)
+            dones = dones.unsqueeze(0)
+
+        num_batches = hidden_state.shape[1]
+        extra_rows = int(dones.sum().item())
+        
+        #Generate a new padded x and rnn_hxs vector to batch forward pass
+        padded_x = torch.zeros((num_batches + extra_rows, x.shape[1], x.shape[2]))
+        padded_rnn_hxs = torch.zeros((hidden_state.shape[0], num_batches + extra_rows, hidden_state.shape[2]))
+
+        batchable_rows = (dones == 0).all(dim=1)
+        num_batchable_rows = batchable_rows.sum().item()
+        individual_rows = (~batchable_rows).argwhere().reshape(-1)
+
+        #First N rows will be taken from rows with no dones
+        padded_x[:num_batchable_rows] = x[batchable_rows]
+        padded_rnn_hxs[:, :num_batchable_rows, :] = hidden_state[:, batchable_rows, :]
+
+        #Remaining rows will be filled out in order of rows with dones
+        cur_row_idx = num_batchable_rows
+        for i in individual_rows:
+            breakpoints = (dones[i] == 1).argwhere()
+            cur_idx = 0
+            rnn_hx = hidden_state[:, i, :]
+
+            for breakpoint in breakpoints:
+                if breakpoint == 0:
+                    rnn_hx = self.get_rnn_hxs()
+                    continue
+                padded_x[cur_row_idx, :breakpoint-cur_idx, :] = x[i, cur_idx:breakpoint, :]
+                padded_rnn_hxs[:, cur_row_idx, :] = rnn_hx
+
+                rnn_hx = self.get_rnn_hxs()
+                cur_idx = breakpoint
+                cur_row_idx += 1
+
+            if cur_idx < len(dones[i]):
+                padded_x[cur_row_idx, :len(dones[i])-cur_idx, :] = x[i, cur_idx:, :]
+                padded_rnn_hxs[:, cur_row_idx, :] = rnn_hx
+                cur_row_idx += 1
+
+        #Perform forward pass on new batched
+        output, output_hx = self.gru(padded_x, padded_rnn_hxs)
+
+        #Fill out the expected output by reversing the whole process
+        full_out = torch.zeros((x.shape[0], x.shape[1], self.hidden_size))
+        full_hx_out = torch.zeros((1, x.shape[0], self.hidden_size))
+
+        full_out[batchable_rows] = output[:num_batchable_rows]
+        full_hx_out[:, batchable_rows, :] = output_hx[:, :num_batchable_rows, :]
+
+        cur_row_idx = num_batchable_rows
+        for i in individual_rows:
+            breakpoints = (dones[i] == 1).argwhere()
+            cur_idx = 0
+
+            for breakpoint in breakpoints:
+                if breakpoint == 0:
+                    continue
+                full_out[i, cur_idx:breakpoint, :] = output[cur_row_idx, :breakpoint-cur_idx, :]
+
+                cur_idx = breakpoint
+                cur_row_idx += 1
+
+            if cur_idx < len(dones[i]):
+                full_out[i, cur_idx:, :] = output[cur_row_idx, :len(dones[i])-cur_idx, :]
+                
+                #Remember only the last rnn hidden state gets returned
+                full_hx_out[:, i, :] = output_hx[:, cur_row_idx, :]
+                cur_row_idx += 1
+            else:
+                #If we did not have remaining steps to fill, then we must have had a done
+                # on the last step, so the final rnn_hx should be zeros to return
+                full_hx_out[:, i, :] = self.get_rnn_hxs()
+
+        return full_out, full_hx_out
+            
 
 
 def init(module, weight_init, bias_init, gain=1):
@@ -108,8 +229,10 @@ class RNNQNetwork(nn.Module):
         state_size = env.observation_space.shape[0]
         
         self.relu = nn.ReLU()
-        self.gru = ResettingGRU(input_size=state_size, hidden_size=hidden_size,
-                               batch_first=True)
+        # self.gru = ResettingGRU(input_size=state_size, hidden_size=hidden_size,
+        #                        batch_first=True)
+        self.gru = ResettingGRUBatched(input_size=state_size, hidden_size=hidden_size,
+                                       batch_first=True)
         for name, param in self.gru.named_parameters():
             if 'bias' in name:
                 nn.init.constant_(param, 0)
